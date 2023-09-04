@@ -29,7 +29,7 @@ DATASETS = {
     "uk-hourly-rain-obs": {
         "index": "ob_end_time",
         "skiprows": 61,
-        "columns": ["ob_end_time", "ob_hour_count", "prcp_amt", "prcp_dur"],
+        "columns": ["ob_end_time", "ob_hour_count", "prcp_amt"],
     },
     "uk-soil-temperature-obs": {
         "index": "ob_time",
@@ -37,6 +37,10 @@ DATASETS = {
         "columns": ["ob_time", "q5cm_soil_temp", "q10cm_soil_temp"],
     },
 }
+
+
+def get_available_datasets():
+    return list(DATASETS)
 
 
 def get_counties(dataset="uk-hourly-weather-obs"):
@@ -53,6 +57,7 @@ def get_counties(dataset="uk-hourly-weather-obs"):
     return counties
 
 
+# TODO: document moving of metadata file - maybe add function to do this?
 def get_stations_metadata():
     cols = [
         "historic_county",
@@ -66,7 +71,7 @@ def get_stations_metadata():
         df = pd.read_csv(
             f"/home/sam/ukmo-midas-open/data/{dataset}/midas-open_{dataset}_dv-{DATASET_VERSION}_station-metadata.csv",
             skiprows=46,
-            usecols=["station_file_name"] + cols,
+            usecols=["station_file_name", "src_id"] + cols,
         )
 
         df.drop(df.tail(1).index, inplace=True)
@@ -74,10 +79,11 @@ def get_stations_metadata():
 
         metadata.append(df)
 
-    return (
-        pd.concat(metadata)
-        .groupby("station_file_name")
-        .aggregate({c: "first" for c in cols} | {d: "sum" for d in DATASETS})
+    metadata = pd.concat(metadata)
+    metadata["station"] = metadata["src_id"] + "_" + metadata["station_file_name"]
+
+    return metadata.groupby("station").aggregate(
+        {c: "first" for c in cols} | {d: "sum" for d in DATASETS}
     )
 
 
@@ -106,16 +112,74 @@ def get_station_file_path(dataset, county, station):
 
 
 def load_dataset(dataset):
-    data = []
+    data = {}
     for county in get_counties(dataset):
+        county_data = {}
         for station in get_county_stations(dataset, county):
             station_data = pd.read_parquet(
                 get_station_parquet_file(dataset, county, station)
             )
-            station_data["county"] = county
-            station_data["station"] = station
-            data.append(station_data)
-    return pd.concat(data)
+            station_data.index = pd.to_datetime(station_data.index)
+            county_data[station] = station_data
+        data[county] = county_data
+    return data
+
+
+def load_all():
+    metadata = get_stations_metadata()
+
+    datasets = {}
+    for dataset in get_available_datasets():
+        datasets[dataset] = load_dataset(dataset)
+
+    data = {}
+    for county in metadata["historic_county"].unique():
+        data[county] = {}
+
+    for index, row in metadata.iterrows():
+        station = []
+        county = row["historic_county"]
+
+        for dataset in get_available_datasets():
+            if row[dataset] == 1:
+                station.append(
+                    datasets[dataset][county][index]
+                    .groupby(level=0, dropna=False)
+                    .sum(min_count=1)
+                )
+            else:
+                cols = DATASETS[dataset]["columns"][1:]
+                station.append(pd.DataFrame(columns=cols))
+
+        data[county][index] = pd.concat(station, axis=1)
+
+    return data
+
+
+def spread_rain_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Randomly distribute rain data in its sample,
+    to match the other datasets. This makes it so that,
+    for example, all rain data from the last 12 hours is
+    spread across this time.
+    """
+
+    new_rows = {}
+    for index, row in df.iterrows():
+        amount = row["prcp_amt"]
+        duration = row["ob_hour_count"]
+
+        random_dist = np.random.dirichlet(np.ones(int(duration)))
+
+        for i in range(0, int(duration)):
+            new_rows[index - pd.Timedelta(hours=i)] = {
+                "prcp_amt": amount * random_dist[i]
+            }
+
+    rain = pd.DataFrame.from_dict(new_rows, orient="index").sort_index()
+    rain.index.name = "ob_time"
+
+    return rain
 
 
 def convert_data(dataset, verbose=False):
@@ -145,6 +209,12 @@ def convert_data(dataset, verbose=False):
                 station_data.append(df)
 
             station_df = pd.concat(station_data)
+            station_df.index = pd.to_datetime(station_df.index)
+
+            # TODO: Currently distributes rain data at random - change?
+            if station_df.index.name != "ob_time":
+                station_df = spread_rain_data(station_df)
+
             df_pa = pa.Table.from_pandas(station_df)
             pq.write_table(
                 df_pa,
@@ -174,3 +244,20 @@ def haversine_distance(lat1, lon1, lat2, lon2):
             )
         )
     )
+
+
+def find_nearest_stations(lat, lon, n=20, include_self=False):
+    stations = get_stations_metadata()[
+        ["station_latitude", "station_longitude", "historic_county"]
+        + get_available_datasets()
+    ]
+
+    stations["distance_to"] = haversine_distance(
+        lat, lon, stations["station_latitude"], stations["station_longitude"]
+    )
+
+    stations.sort_values("distance_to", ascending=True, inplace=True)
+    if not include_self and stations.iloc[0]["distance_to"] == 0:
+        stations.drop(stations.head(1).index, inplace=True)
+
+    return stations[:n]
