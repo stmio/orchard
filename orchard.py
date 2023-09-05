@@ -22,8 +22,6 @@ DATASETS = {
             "air_temperature",
             "rltv_hum",
             "msl_pressure",
-            "stn_pres",
-            "alt_pres",
         ],
     },
     "uk-hourly-rain-obs": {
@@ -34,7 +32,7 @@ DATASETS = {
     "uk-soil-temperature-obs": {
         "index": "ob_time",
         "skiprows": 85,
-        "columns": ["ob_time", "q5cm_soil_temp", "q10cm_soil_temp"],
+        "columns": ["ob_time", "q10cm_soil_temp"],
     },
 }
 
@@ -85,6 +83,10 @@ def get_stations_metadata():
     return metadata.groupby("station").aggregate(
         {c: "first" for c in cols} | {d: "sum" for d in DATASETS}
     )
+
+
+def stations_count():
+    return len(get_stations_metadata().index)
 
 
 def get_county_stations(dataset, county):
@@ -152,6 +154,9 @@ def load_all():
                 station.append(pd.DataFrame(columns=cols))
 
         data[county][index] = pd.concat(station, axis=1)
+        data[county][index].drop("ob_hour_count", axis=1, errors="ignore", inplace=True)
+        data[county][index].index = pd.to_datetime(data[county][index].index)
+        data[county][index] = data[county][index].astype(np.float64)
 
     return data
 
@@ -180,6 +185,44 @@ def spread_rain_data(df: pd.DataFrame) -> pd.DataFrame:
     rain.index.name = "ob_time"
 
     return rain
+
+
+def fill_missing(data):
+    for county in data:
+        for station in data[county]:
+            data[county][station] = data[county][station].resample("1H").asfreq()
+
+    metadata = get_stations_metadata()
+    for county in data:
+        for station in data[county]:
+            near = find_nearest_stations(
+                metadata.loc[station]["station_latitude"],
+                metadata.loc[station]["station_longitude"],
+            )
+
+            i = 0  # TODO: change to for loop
+            while data[county][station].isnull().values.any():
+                try:
+                    data[county][station].fillna(
+                        data[near.iloc[i]["historic_county"]][near.iloc[i].name],
+                        axis=0,
+                        inplace=True,
+                    )
+                except IndexError:
+                    break
+                i += 1
+
+            data[county][station].interpolate(
+                method="linear", limit_direction="both", inplace=True
+            )
+
+    contains_na = []
+    for county in data:
+        for station in data[county]:
+            if data[county][station].isnull().values.any():
+                contains_na.append(station)
+
+    return data, contains_na
 
 
 def convert_data(dataset, verbose=False):
@@ -246,7 +289,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     )
 
 
-def find_nearest_stations(lat, lon, n=20, include_self=False):
+def find_nearest_stations(lat, lon, n=100, include_self=False):
     stations = get_stations_metadata()[
         ["station_latitude", "station_longitude", "historic_county"]
         + get_available_datasets()
@@ -260,4 +303,4 @@ def find_nearest_stations(lat, lon, n=20, include_self=False):
     if not include_self and stations.iloc[0]["distance_to"] == 0:
         stations.drop(stations.head(1).index, inplace=True)
 
-    return stations[:n]
+    return stations if n == -1 else stations[:n]
