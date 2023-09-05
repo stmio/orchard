@@ -5,6 +5,7 @@ import pyarrow.parquet as pq
 
 import os
 import glob
+import pickle
 from datetime import datetime
 
 
@@ -271,6 +272,19 @@ def convert_data(dataset, verbose=False):
                 )
 
     print(f"All data converted to parquet for {dataset}")
+
+
+def pickle_data(data, path=(os.getcwd() + "/orchard-data")):
+    file = open(path + ".pkl", "wb")
+    pickle.dump(data, file)
+    file.close()
+
+
+def unpickle_data(path=(os.getcwd() + "/orchard-data")):
+    file = open(path + ".pkl", "rb")
+    data = pickle.load(file)
+    file.close()
+    return data
 
 
 def haversine_distance(lat1, lon1, lat2, lon2):
