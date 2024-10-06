@@ -3,3 +3,5 @@ cufile.log
 data
 metadata
 *.pkl
+*.pkl.tar.gz
+*.csv

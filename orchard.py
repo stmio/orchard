@@ -1,12 +1,22 @@
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 import pyarrow as pa
 import pyarrow.parquet as pq
+from sklearn.preprocessing import MinMaxScaler
 
 import os
 import glob
 import pickle
+from tqdm.notebook import tqdm
 from datetime import datetime
+
+from typing import Callable, Dict, Tuple, TypeAlias
+from typeguard import check_type
+
+
+# Don't show tf warnings until https://github.com/tensorflow/tensorflow/issues/62963 released
+tf.get_logger().setLevel("ERROR")
 
 
 # See https://help.ceda.ac.uk/article/4982-midas-open-user-guide/
@@ -36,6 +46,30 @@ DATASETS = {
         "columns": ["ob_time", "q10cm_soil_temp"],
     },
 }
+
+min_max = MinMaxScaler()
+
+DatasetsType: TypeAlias = Dict[str, Dict[str, np.ndarray | pd.DataFrame]]
+DatasetType: TypeAlias = np.ndarray | pd.DataFrame
+
+
+def assert_dataset(d):
+    assert check_type(d, DatasetsType)
+
+
+# Runs function "f" on every station dataset in the dictionary
+# TODO: rename map_all?
+def run_all(f: Callable, data: DatasetsType, verbose: bool = False) -> DatasetsType:
+    assert_dataset(data)
+
+    for county in tqdm(data, delay=2):
+        for station in data[county]:
+            if verbose:
+                print(county + ": " + station)
+
+            data[county][station] = f(data[county][station])
+
+    return data
 
 
 def get_available_datasets():
@@ -188,6 +222,7 @@ def spread_rain_data(df: pd.DataFrame) -> pd.DataFrame:
     return rain
 
 
+# TODO: currently not called anywhere
 def fill_missing(data):
     for county in data:
         for station in data[county]:
@@ -318,3 +353,144 @@ def find_nearest_stations(lat, lon, n=100, include_self=False):
         stations.drop(stations.head(1).index, inplace=True)
 
     return stations if n == -1 else stations[:n]
+
+
+def min_max_scale(df):
+    return min_max.fit_transform(df)
+
+
+def inverse_min_max_scale(df):
+    return min_max.inverse_transform(df)
+
+
+def get_time_features(
+    index: pd.DatetimeIndex,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    # Extract individual time features from index
+    mins = pd.Series(index.minute.values, name="mins")
+    hours = pd.Series(index.hour.values, name="hours")
+    days = pd.Series(index.day.values, name="days")
+    months = pd.Series(index.month.values, name="months")
+    years = pd.Series(index.year.values, name="years")
+
+    return mins, hours, days, months, years
+
+
+def window_dataset(data, steps, horizon, batch_size, shuffle_buffer):
+    # create a window with n steps back plus the size of the prediction length
+    window = steps + horizon
+
+    # create the inital tensor dataset
+    with tf.device("CPU"):
+        ds = tf.data.Dataset.from_tensor_slices(data)
+
+    # create the window function shifting the data by the prediction length
+    ds = ds.window(window, shift=horizon, drop_remainder=True)
+
+    # flatten the dataset and batch into the window size
+    ds = ds.flat_map(lambda x: x.batch(window))
+    ds = ds.shuffle(shuffle_buffer)
+
+    # create the supervised learning problem x and y and batch
+    ds = ds.map(lambda x: (x[:-horizon], x[-horizon:, :1]))
+
+    ds = ds.batch(batch_size).prefetch(1)
+
+    return ds
+
+
+def get_params() -> Tuple[int, int, int, float]:
+    learning_rate = 3e-4
+    steps = 24 * 30
+    horizon = 24
+    features = 12
+
+    return steps, horizon, features, learning_rate
+
+
+def build_station_dataset(
+    data: DatasetType,
+    steps=24 * 30,
+    horizon=24,
+    batch_size=256,
+    shuffle_buffer=500,
+):
+    # TODO: add station number as well?
+    times = get_time_features(data.index)
+    data = pd.concat([data.reset_index(drop=True), *times], axis=1)
+
+    data = min_max_scale(data)
+
+    # TODO: split data
+
+    data = window_dataset(data, steps, horizon, batch_size, shuffle_buffer)
+
+    return data
+
+
+def build_dataset(
+    data,
+    steps=24 * 30,
+    horizon=24,
+    batch_size=256,
+    shuffle_buffer=500,
+):
+    tf.random.set_seed(64)
+
+    ds = run_all(
+        lambda x: build_station_dataset(x, steps, horizon, batch_size, shuffle_buffer),
+        data,
+    )
+
+    return ds
+
+
+def lstm_cnn_model(steps, horizon, features, learning_rate):
+    tf.keras.backend.clear_session()
+
+    model = tf.keras.models.Sequential(
+        [
+            tf.keras.layers.Conv1D(
+                64, kernel_size=6, activation="relu", input_shape=(steps, features)
+            ),
+            tf.keras.layers.MaxPooling1D(2),
+            tf.keras.layers.Conv1D(64, kernel_size=3, activation="relu"),
+            tf.keras.layers.MaxPooling1D(2),
+            tf.keras.layers.LSTM(72, activation="relu", return_sequences=True),
+            tf.keras.layers.LSTM(48, activation="relu", return_sequences=False),
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.Dense(128),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.Dense(horizon),
+        ],
+        name="lstm_cnn",
+    )
+
+    loss = tf.keras.losses.Huber()
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+
+    model.compile(loss=loss, optimizer=optimizer, metrics=["mae"])
+
+    return model
+
+
+# TODO: remove?
+def fit_model_to_station(data, model, epochs):
+    model_hist = model.fit(data, epochs=epochs)
+    return model, model_hist
+
+
+def run_model(ds, epochs, steps, horizon, features, learning_rate):
+    model = lstm_cnn_model(steps, horizon, features, learning_rate=learning_rate)
+    model_hist = {"loss": [], "mae": []}
+
+    for county in tqdm(ds):
+        for station in ds[county]:
+            model, h = fit_model_to_station(ds[county][station], model, epochs)
+            model_hist = {
+                key: np.hstack([model_hist[key], h.history[key]])
+                for key in h.history.keys()
+            }
+
+    return model, model_hist
